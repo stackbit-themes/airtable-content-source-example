@@ -1,56 +1,76 @@
-import Container from '../components/container'
-import MoreStories from '../components/more-stories'
-import HeroPost from '../components/hero-post'
-import Intro from '../components/intro'
-import Layout from '../components/layout'
-import { getAllPosts } from '../lib/api'
-import Head from 'next/head'
-import { CMS_NAME } from '../lib/constants'
-import Post from '../interfaces/post'
+import Container from '../components/container';
+import MoreStories from '../components/more-stories';
+import HeroPost from '../components/hero-post';
+import Intro from '../components/intro';
+import Layout from '../components/layout';
+import Head from 'next/head';
+import { CMS_NAME } from '../lib/constants';
+import Post from '../interfaces/post';
+import { getAirtableClient, PostRecordFields, AuthorRecordFields } from '../lib/airtable-client';
+import { getLinkedAsset, getLinkedRecord } from '../lib/utils';
 
 type Props = {
-  allPosts: Post[]
-}
+    allPosts: Post[];
+};
 
 export default function Index({ allPosts }: Props) {
-  const heroPost = allPosts[0]
-  const morePosts = allPosts.slice(1)
-  return (
-    <>
-      <Layout>
-        <Head>
-          <title>Next.js Blog Example with {CMS_NAME}</title>
-        </Head>
-        <Container>
-          <Intro />
-          {heroPost && (
-            <HeroPost
-              title={heroPost.title}
-              coverImage={heroPost.coverImage}
-              date={heroPost.date}
-              author={heroPost.author}
-              slug={heroPost.slug}
-              excerpt={heroPost.excerpt}
-            />
-          )}
-          {morePosts.length > 0 && <MoreStories posts={morePosts} />}
-        </Container>
-      </Layout>
-    </>
-  )
+    const heroPost = allPosts[0];
+    const morePosts = allPosts.slice(1);
+    const title = `Next.js Blog Example with ${CMS_NAME}`;
+    return (
+        <>
+            <Layout>
+                <Head>
+                    <title>{title}</title>
+                </Head>
+                <Container>
+                    <Intro />
+                    {heroPost && <HeroPost post={heroPost} />}
+                    {morePosts.length > 0 && <MoreStories posts={morePosts} />}
+                </Container>
+            </Layout>
+        </>
+    );
 }
+
+const airtableClient = getAirtableClient();
+const preview = process.env.NODE_ENV === 'development';
 
 export const getStaticProps = async () => {
-  const allPosts = getAllPosts([
-    'title',
-    'date',
-    'slug',
-    'author',
-    'coverImage',
-    'excerpt',
-  ])
+    const postRecords = await airtableClient.getStatefulRecordsForTable<PostRecordFields>({
+        preview,
+        tableId: 'Posts',
+        sort: [{ field: 'Date', direction: 'desc' }],
+        fields: ['Title', 'Date', 'Slug', 'Author', 'CoverImage', 'Excerpt']
+    });
+    const allPosts: Post[] = [];
+    for (const postRecord of postRecords) {
+        const authorRecord = await getLinkedRecord<AuthorRecordFields>({
+            tableName: 'Authors',
+            field: postRecord.fields.Author,
+            airtableClient,
+            preview
+        });
+        const author = authorRecord
+            ? {
+                  id: authorRecord.id,
+                  name: authorRecord.fields.Name,
+                  picture: await getLinkedAsset(authorRecord.fields.Picture, airtableClient)
+              }
+            : null;
 
-  return {
-    props: { allPosts },
-  }
-}
+        allPosts.push({
+            id: postRecord.id,
+            title: postRecord.fields.Title,
+            date: postRecord.fields.Date,
+            slug: postRecord.fields.Slug,
+            author: author,
+            coverImage: await getLinkedAsset(postRecord.fields['CoverImage'], airtableClient),
+            excerpt: postRecord.fields.Excerpt
+        });
+    }
+
+    return {
+        props: { allPosts }
+    };
+};
