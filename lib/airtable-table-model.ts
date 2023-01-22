@@ -7,6 +7,8 @@ export interface AirtableTableModel {
     views: AirtableViewModel[];
 }
 
+export type AirtableFieldType = AirtableFieldModel['type'];
+
 export interface AirtableViewModel {
     id: string;
     type: 'grid' | 'form' | 'calendar' | 'gallery' | 'kanban' | 'timeline' | 'block';

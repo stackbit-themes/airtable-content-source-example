@@ -1,3 +1,4 @@
+import Airtable from 'airtable';
 import type {
     ContentSourceInterface,
     InitOptions,
@@ -21,7 +22,7 @@ import {
     convertAirtableAssetRecordsToStackbitAssets,
     convertOperationFieldToAirtableField
 } from './airtable-utils';
-import { AirtableClient, AssetRecordFields, StateFields } from '../lib/airtable-client';
+import { AirtableClient, AssetRecordFields, StateFields, StatefulRecord } from '../lib/airtable-client';
 
 interface UserContext {
     // Add user-specific properties like OAuth accessToken.
@@ -47,10 +48,13 @@ export class AirtableContentSource implements ContentSourceInterface<UserContext
     private logger!: Logger;
     private userLogger!: Logger;
     private airtableClient!: AirtableClient;
-    private onContentChange: undefined | ((contentChangeEvent: ContentChangeEvent<DocumentContext, AssetContext>) => void);
+    private onContentChange?: (contentChangeEvent: ContentChangeEvent<DocumentContext, AssetContext>) => void;
+    private onSchemaChange?: () => void;
     private assetsTableName: string;
     private assetsTableId: undefined | string;
     private getModelMap: undefined | (() => ModelMap);
+    private airtableWebhookCursor: number = 1;
+    private airtableWebhookId?: string;
 
     constructor({ personalAccessToken, baseId, assetsTableName }: ContentSourceOptions) {
         if (!personalAccessToken) {
@@ -122,13 +126,13 @@ export class AirtableContentSource implements ContentSourceInterface<UserContext
      * @param options.localDev A boolean flag indicating if the content source
      *   is running in local development mode using the `stackbit dev` command
      *   (true), or if it is running in Stackbit cloud project (false).
-     * @param options.webhookUrl A string representing a Stackbit webhook URL that the
-     *   content source module can use to create webhooks between the content
-     *   source and Stackbit. Webhooks need to be set once. Use hard-coded
-     *   webhook names to check that the webhook was already created. This
-     *   parameter is empty in localDev
+     * @param options.webhookUrl A string representing a Stackbit webhook URL
+     *   that the content source module can use to create webhooks between the
+     *   content source and Stackbit. Webhooks need to be set once. Use
+     *   hard-coded webhook names to check that the webhook was already created.
+     *   This parameter is empty when `localDev` is `true`.
      */
-    async init({ logger, userLogger, localDev }: InitOptions): Promise<void> {
+    async init({ logger, userLogger, localDev, webhookUrl }: InitOptions): Promise<void> {
         this.airtableClient = new AirtableClient({
             baseId: this.baseId,
             personalAccessToken: this.personalAccessToken
@@ -136,6 +140,23 @@ export class AirtableContentSource implements ContentSourceInterface<UserContext
         this.logger = logger.createLogger({ label: 'airtable' });
         this.userLogger = userLogger.createLogger({ label: 'airtable' });
         this.logger.debug(`initialized AirtableContentSource, baseId: ${this.baseId}`);
+
+        if (webhookUrl) {
+            this.logger.debug(`checking if webhook for ${webhookUrl} exists`);
+            let webhook = await this.airtableClient.getWebhook({ webhookUrl });
+            if (!webhook) {
+                this.logger.debug(`no webhook for ${webhookUrl}, creating a new webhook`);
+                const newWebhook = await this.airtableClient.createWebhook({ webhookUrl });
+                if (newWebhook) {
+                    webhook = await this.airtableClient.getWebhook({ webhookId: newWebhook.id });
+                }
+            }
+            if (webhook) {
+                this.airtableWebhookId = webhook.id;
+                this.airtableWebhookCursor = webhook.cursorForNextPayload;
+                this.logger.debug(`next airtable webhook cursor: ${this.airtableWebhookCursor}`);
+            }
+        }
     }
 
     /**
@@ -183,8 +204,123 @@ export class AirtableContentSource implements ContentSourceInterface<UserContext
      * method.
      *
      * This method is not called in local development (when localDev is true).
+     * To debug webhooks locally, you will need to create a public URL that
+     * forwards external webhooks to stackbit dev's internal port: `localhost:8090`.
+     * You can use a tool like 'ngrok' and run `ngrok http 8090` to create a
+     * public URL that forwards webhooks to stackbit dev. Ngrok will print the
+     * public URL it created (e.g., https://xyz.ngrok.io).
+     * Use this URL when running stackbit dev:
+     * `stackbit dev --log-level=debug --csi-webhook-url=https://xyz.ngrok.io/_stackbit/onWebhook`
      */
-    onWebhook(data: { data: unknown; headers: Record<string, string> }): void {}
+    async onWebhook(data: { data: { base: { id: string }; webhook: { id: string }; timestamp: string }; headers: Record<string, string> }): Promise<void> {
+        const webhookData = data.data;
+        this.logger.debug(`onWebhook => base.id = ${webhookData.base.id} webhook.id = ${webhookData.webhook.id}`);
+        if (webhookData.webhook.id !== this.airtableWebhookId) {
+            this.logger.debug(`webhook webhook.id '${webhookData.webhook.id}' doesn't match the stored webhook ID ${this.airtableWebhookId}, ignoring webhook`);
+            return;
+        }
+        const modelMap = this.getModelMap?.()!;
+        let schemaChanged = false;
+        let mightHaveMore = true;
+        const createdAndUpdatedRecordIdPairs: string[] = [];
+        const createdAndUpdatedAssetIds: string[] = [];
+        const deletedRecordIdPairs: string[] = [];
+        const deletedAssetIds: string[] = [];
+        while (mightHaveMore) {
+            const result = await this.airtableClient.getWebhookPayloads({
+                webhookId: webhookData.webhook.id,
+                cursor: this.airtableWebhookCursor
+            });
+            const payloads = result.payloads;
+            for (const payload of payloads) {
+                if (schemaChanged) {
+                    break;
+                }
+                if (payload.destroyedTableIds || payload.createdTablesById) {
+                    schemaChanged = true;
+                    break;
+                }
+                if (payload.changedTablesById) {
+                    for (const [tableId, changedTableData] of Object.entries(payload.changedTablesById)) {
+                        if (
+                            changedTableData.changedMetadata ||
+                            changedTableData.changedFieldsById ||
+                            changedTableData.createdFieldsById ||
+                            changedTableData.destroyedFieldIds
+                        ) {
+                            schemaChanged = true;
+                            break;
+                        }
+                        if (changedTableData.createdRecordsById) {
+                            if (tableId === this.assetsTableId) {
+                                createdAndUpdatedAssetIds.push(...Object.keys(changedTableData.createdRecordsById));
+                            } else {
+                                createdAndUpdatedRecordIdPairs.push(
+                                    ...Object.keys(changedTableData.createdRecordsById).map((recordId) => `${tableId}:${recordId}`)
+                                );
+                            }
+                        }
+                        if (changedTableData.changedRecordsById) {
+                            if (tableId === this.assetsTableId) {
+                                createdAndUpdatedAssetIds.push(...Object.keys(changedTableData.changedRecordsById));
+                            } else {
+                                createdAndUpdatedRecordIdPairs.push(
+                                    ...Object.keys(changedTableData.changedRecordsById).map((recordId) => `${tableId}:${recordId}`)
+                                );
+                            }
+                        }
+                        if (changedTableData.destroyedRecordIds) {
+                            if (tableId === this.assetsTableId) {
+                                deletedAssetIds.push(...changedTableData.destroyedRecordIds);
+                            } else {
+                                deletedRecordIdPairs.push(...changedTableData.destroyedRecordIds.map((recordId) => `${tableId}:${recordId}`));
+                            }
+                        }
+                    }
+                }
+            }
+            this.airtableWebhookCursor = result.cursor;
+            mightHaveMore = result.mightHaveMore;
+        }
+        if (schemaChanged) {
+            this.onSchemaChange?.();
+        } else if (createdAndUpdatedRecordIdPairs.length || createdAndUpdatedAssetIds.length || deletedRecordIdPairs.length || deletedAssetIds.length) {
+            const createdAndUpdatedRecordIdsArr = [...Array.from(new Set(createdAndUpdatedRecordIdPairs))];
+            const createdAndUpdatedAssetIdsArr = [...Array.from(new Set(createdAndUpdatedAssetIds))];
+            const createdAndUpdatedRecords: StatefulRecord<StateFields>[] = [];
+            const updatedAssetRecords: Airtable.Record<AssetRecordFields>[] = [];
+            for (const idPair of createdAndUpdatedRecordIdsArr) {
+                const [tableId, recordId] = idPair.split(':');
+                const record = await this.airtableClient.getStatefulRecordById({
+                    tableId: tableId,
+                    recordId: recordId,
+                    preview: true,
+                    includeToBeDeleted: true
+                });
+                if (record) {
+                    createdAndUpdatedRecords.push(record);
+                }
+            }
+            for (const assetId of createdAndUpdatedAssetIdsArr) {
+                const assetRecord = await this.airtableClient.getAirtableRecordById<AssetRecordFields>({
+                    tableId: this.assetsTableId!,
+                    recordId: assetId
+                });
+                if (assetRecord) {
+                    updatedAssetRecords.push(assetRecord);
+                }
+            }
+            const documents = convertAirtableRecordsToStackbitDocuments(createdAndUpdatedRecords, modelMap, this.manageUrl);
+            const assets = convertAirtableAssetRecordsToStackbitAssets(updatedAssetRecords, `${this.manageUrl}/${this.assetsTableId}`);
+            const contentChanges: ContentChangeEvent<DocumentContext, AssetContext> = {
+                documents: documents,
+                assets: assets,
+                deletedDocumentIds: [...Array.from(new Set(deletedRecordIdPairs))],
+                deletedAssetIds: [...Array.from(new Set(deletedAssetIds))]
+            };
+            this.onContentChange?.(contentChanges);
+        }
+    }
 
     /**
      * Stackbit calls the startWatchingContentUpdates() after it has fetched all
@@ -212,6 +348,7 @@ export class AirtableContentSource implements ContentSourceInterface<UserContext
     }): void {
         this.getModelMap = options.getModelMap;
         this.onContentChange = options.onContentChange;
+        this.onSchemaChange = options.onSchemaChange;
     }
 
     /**

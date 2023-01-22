@@ -2,6 +2,7 @@ import Airtable from 'airtable';
 import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
 
 import type { AirtableTableModel } from './airtable-table-model';
+import { AirtableWebhook, AirtableWebhookPayload, AirtableWebhookSpecification } from './airtable-webhook-types';
 
 /**
  * The AirtableClient extends the native Airtable client with additional logic
@@ -466,6 +467,55 @@ export class AirtableClient {
             publishedRecords,
             deletedRecordsIds
         };
+    }
+
+    async getWebhook({ webhookId, webhookUrl }: { webhookId?: string; webhookUrl?: string }): Promise<AirtableWebhook | undefined> {
+        const response = await axios({
+            method: 'GET',
+            baseURL: 'https://api.airtable.com/v0/',
+            headers: { Authorization: `Bearer ${this.personalAccessToken}` },
+            url: `bases/${this.baseId}/webhooks`
+        });
+        const webhooks: AirtableWebhook[] = response.data.webhooks ?? [];
+        return webhooks.find((webhook: any) => webhook.id === webhookId || webhook.notificationUrl === webhookUrl);
+    }
+
+    async createWebhook({ webhookUrl }: { webhookUrl: string }): Promise<{ id: string; macSecretBase64: string; expirationTime?: string }> {
+        const specification: AirtableWebhookSpecification = {
+            filters: {
+                dataTypes: ['tableData', 'tableFields']
+            }
+        };
+        const response = await axios({
+            method: 'POST',
+            baseURL: 'https://api.airtable.com/v0/',
+            headers: { Authorization: `Bearer ${this.personalAccessToken}` },
+            url: `bases/${this.baseId}/webhooks`,
+            data: {
+                notificationUrl: webhookUrl,
+                specification: {
+                    options: specification
+                }
+            }
+        });
+        return response.data;
+    }
+
+    async getWebhookPayloads({
+        webhookId,
+        cursor
+    }: {
+        webhookId: string;
+        cursor?: number;
+    }): Promise<{ cursor: number; mightHaveMore: boolean; payloads: AirtableWebhookPayload[] }> {
+        const response = await axios({
+            method: 'GET',
+            baseURL: 'https://api.airtable.com/v0/',
+            headers: { Authorization: `Bearer ${this.personalAccessToken}` },
+            url: `bases/${this.baseId}/webhooks/${webhookId}/payloads`,
+            ...(typeof cursor !== 'undefined' ? { params: { cursor } } : {})
+        });
+        return response.data;
     }
 }
 
