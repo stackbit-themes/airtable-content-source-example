@@ -401,7 +401,7 @@ export class AirtableContentSource implements ContentSourceInterface<UserContext
                         throw new Error(`updating field of type ${modelField.type} not implemented`);
                     default:
                         const _exhaustiveCheck: never = modelField;
-                        return _exhaustiveCheck;
+                        break;
                 }
             } else if (['insert', 'remove', 'reorder'].includes(operation.opType)) {
                 throw new Error(`'${operation.opType}' operation not implemented`);
